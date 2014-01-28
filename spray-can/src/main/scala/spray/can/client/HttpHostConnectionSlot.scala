@@ -130,8 +130,11 @@ private class HttpHostConnectionSlot(host: String, port: Int,
       log.warning("Received unexpected response for non-existing request: {}, dropping", x)
 
     case ctx: RequestContext ⇒
-      dispatchToServer(httpConnection)(ctx)
-      context.become(connected(httpConnection, openRequests.enqueue(ctx), closeAfterResponseEnd))
+      if(ctx.hasTimeLeft) {
+        dispatchToServer(httpConnection)(ctx)
+        context.become(connected(httpConnection, openRequests.enqueue(ctx), closeAfterResponseEnd))
+      } else dispatchToCommander(ctx, Status.Failure(NoTimeLeftException))
+
 
     case ev @ Http.SendFailed(part) ⇒
       log.debug("Sending {} failed, closing connection", format(part))
@@ -189,12 +192,16 @@ private class HttpHostConnectionSlot(host: String, port: Int,
     }
 
   def redirect(location: Location, method: HttpMethod, ctx: RequestContext) {
-    val baseUri = ctx.request.uri.toEffectiveHttpRequestUri(Uri.Host(host), port, sslEncryption)
-    val redirectUri = location.uri.resolvedAgainst(baseUri)
-    val request = HttpRequest(method, redirectUri)
+    if(ctx.hasTimeLeft) {
+      val baseUri = ctx.request.uri.toEffectiveHttpRequestUri(Uri.Host(host), port, sslEncryption)
+      val redirectUri = location.uri.resolvedAgainst(baseUri)
+      val request = HttpRequest(method, redirectUri)
 
-    if (log.isDebugEnabled) log.debug("Redirecting to {}", redirectUri.toString)
-    IO(Http)(context.system) ! ctx.copy(request = request, redirectsLeft = ctx.redirectsLeft - 1)
+      if (log.isDebugEnabled) log.debug("Redirecting to {}", redirectUri.toString)
+      IO(Http)(context.system) ! ctx.copy(request = request, redirectsLeft = ctx.redirectsLeft - 1)
+    }
+    else
+      dispatchToCommander(ctx, Status.Failure(NoTimeLeftException))
   }
 
   def closing(httpConnection: ActorRef, openRequests: Queue[RequestContext], error: String, retry: RetryMode): Receive =
@@ -233,9 +240,15 @@ private class HttpHostConnectionSlot(host: String, port: Int,
 
   def clear(error: String, retry: RetryMode): RequestContext ⇒ Unit = clear(new Http.ConnectionException(error), retry)
   def clear(error: Http.ConnectionException, retry: RetryMode): RequestContext ⇒ Unit = {
-    case ctx @ RequestContext(request, retriesLeft, _, _) if retry.shouldRetry(request) && retriesLeft > 0 ⇒
-      log.warning("{} in response to {} with {} retries left, retrying...", error.getMessage, format(request), retriesLeft)
-      context.parent ! ctx.copy(retriesLeft = retriesLeft - 1)
+    case ctx @ RequestContext(request, retriesLeft, _, _, _) if retry.shouldRetry(request) && retriesLeft > 0 ⇒
+      if(ctx.hasTimeLeft) {
+        log.warning("{} in response to {} with {} retries left, retrying...", error.getMessage, format(request), retriesLeft)
+        context.parent ! ctx.copy(retriesLeft = retriesLeft - 1)
+      } else {
+        log.warning("{} in response to {} with {} retries left but not time left to retry. Aborting the request",
+          error.getMessage, format(request), retriesLeft)
+        dispatchToCommander(ctx, Status.Failure(NoTimeLeftException))
+      }
 
     case ctx: RequestContext ⇒
       log.warning("{} in response to {} with no retries left, dispatching error...", error.getMessage, format(ctx.request))
@@ -249,7 +262,7 @@ private class HttpHostConnectionSlot(host: String, port: Int,
   }
 
   def dispatchToCommander(requestContext: RequestContext, message: Any): Unit = {
-    val RequestContext(request, _, _, commander) = requestContext
+    val RequestContext(request, _, _, _, commander) = requestContext
     if (log.isDebugEnabled) log.debug("Delivering {} for {}", formatResponse(message), format(request))
     commander ! message
   }

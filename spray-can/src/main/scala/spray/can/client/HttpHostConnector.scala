@@ -16,10 +16,12 @@
 
 package spray.can.client
 
+import scala.annotation.tailrec
 import scala.collection.immutable.Queue
 import akka.actor._
 import spray.http.{ Uri, HttpHeaders, HttpRequest }
 import spray.can.Http
+import scala.concurrent.duration._
 
 private[can] class HttpHostConnector(normalizedSetup: Http.HostConnectorSetup, clientConnectionSettingsGroup: ActorRef)
     extends Actor with ActorLogging {
@@ -49,7 +51,11 @@ private[can] class HttpHostConnector(normalizedSetup: Http.HostConnectorSetup, c
   def receive: Receive = {
     case request: HttpRequest ⇒
       val requestWithDefaultHeaders = request.withDefaultHeaders(headers)
-      dispatchStrategy(RequestContext(requestWithDefaultHeaders, settings.maxRetries, settings.maxRedirects, sender))
+      dispatchStrategy(RequestContext(requestWithDefaultHeaders, settings.maxRetries, settings.maxRedirects, None, sender))
+
+    case DeadlinedRequest(request, deadline) ⇒
+      val requestWithDefaultHeaders = request.withDefaultHeaders(headers)
+      dispatchStrategy(RequestContext(requestWithDefaultHeaders, settings.maxRetries, settings.maxRedirects, Some(deadline), sender))
 
     case ctx: RequestContext ⇒
       // either a retry or redirect
@@ -184,12 +190,28 @@ private[can] class HttpHostConnector(normalizedSetup: Http.HostConnectorSetup, c
         case None             ⇒ queue = queue.enqueue(ctx)
       }
 
-    def onConnectionStateChange(): Unit =
-      if (queue.nonEmpty)
+    def onConnectionStateChange(): Unit = {
+      val (firstWithTimeLeft, remaining) = dequeueWithTimeLeft(queue)
+
+      firstWithTimeLeft.map(ctx ⇒
         pickConnection foreach { connection ⇒
-          dispatch(queue.head, connection)
-          queue = queue.tail
+          dispatch(ctx, connection)
+        })
+      queue = remaining
+    }
+
+    @tailrec private def dequeueWithTimeLeft(queue: Queue[RequestContext]): (Option[RequestContext], Queue[RequestContext]) = {
+      if (queue.isEmpty) (None, Queue.empty)
+      else {
+        val (ctx, remaining) = queue.dequeue
+
+        if (ctx.hasTimeLeft) (Some(ctx), remaining)
+        else {
+          ctx.commander ! Status.Failure(NoTimeLeftException)
+          dequeueWithTimeLeft(remaining)
         }
+      }
+    }
 
     // picks a connection to schedule the next request to, returns None if no connection
     // is currently available and the next request therefore needs to be queued
@@ -231,7 +253,9 @@ private[can] class HttpHostConnector(normalizedSetup: Http.HostConnectorSetup, c
 }
 
 private[can] object HttpHostConnector {
-  case class RequestContext(request: HttpRequest, retriesLeft: Int, redirectsLeft: Int, commander: ActorRef)
+  case class RequestContext(request: HttpRequest, retriesLeft: Int, redirectsLeft: Int, deadline: Option[Deadline], commander: ActorRef) {
+    def hasTimeLeft = deadline.map(_.hasTimeLeft()).getOrElse(true)
+  }
   case class Disconnected(rescheduledRequestCount: Int)
   case object RequestCompleted
   case object DemandIdleShutdown

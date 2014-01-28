@@ -52,8 +52,20 @@ private[can] class HttpManager(httpSettings: HttpExt#Settings) extends Actor wit
           sender ! Status.Failure(e)
       }
 
+    case deadlinedRequest @ DeadlinedRequest(request, _) ⇒
+      try {
+        val req = request.withEffectiveUri(securedConnection = false)
+        val connector = connectorForUri(req.uri)
+        // never render absolute URIs here and we also drop any potentially existing fragment
+        connector.forward(deadlinedRequest.copy(request = request.copy(uri = req.uri.toRelative.withoutFragment)))
+      } catch {
+        case NonFatal(e) ⇒
+          log.error("Illegal request: {}", e.getMessage)
+          sender ! Status.Failure(e)
+      }
+
     // 3xx Redirect
-    case ctx @ RequestContext(req, _, _, commander) ⇒
+    case ctx @ RequestContext(req, _, _, _, commander) ⇒
       val connector = connectorForUri(req.uri)
       // never render absolute URIs here and we also drop any potentially existing fragment
       val newReq = req.copy(uri = req.uri.toRelative.withoutFragment)
